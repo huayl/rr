@@ -13,6 +13,35 @@
 
 #if defined(__x86_64__)
 
+.section .plt, "a", @progbits
+PAGE_ALIGN
+
+// Current address is 0x70000000 - PRELOAD_LIBRARY_PAGE_SIZE
+// The following is equal to __rr_dl_runtime_resolve_prelude,
+// but doesn't introduce a relocation record.
+.quad  0x70000000 - PRELOAD_LIBRARY_PAGE_SIZE + 8
+
+STARTPROC_GLOBAL(__rr_dl_runtime_resolve_prelude)
+xchg (%rsp),%rbx
+# r11 is destroyed anyway by _dl_runtime_resolve, so we can use it here.
+mov %rbx,%r11
+mov %rsp,%rbx
+# HACK! The previous instruction ends in byte 0xE3 which looks
+# like a short jump to our Monkeypatcher code, which can interfere
+# with patching of syscalls following this code. The following
+# instruction is a noop whose first byte is 4, so the offset of that
+# false short jump doesn't reach outside this function.
+add $0,%al
+and $0xffffffffffffffc0,%rsp
+fxsave64 -512(%rsp)
+movq $0,(-512+16)(%rsp)
+fxrstor64 -512(%rsp)
+push %r11
+ret
+CFI_ENDPROC
+
+.section .vdso.text, "a", @progbits
+
 #define SYSCALL(which) \
     movq $which, %rax;  \
     syscall; \
@@ -52,6 +81,9 @@ WEAK_ALIAS(gettimeofday,__vdso_gettimeofday)
 .symver __vdso_getcpu,__vdso_getcpu@LINUX_2.6
 
 #elif defined(__i386__)
+
+.section .vdso.text, "a", @progbits
+PAGE_ALIGN
 
 // __vdso functions use the C calling convention, so
 // we have to set up the syscall parameters here.
@@ -109,6 +141,9 @@ WEAK_ALIAS(gettimeofday,__vdso_gettimeofday)
 .symver __vdso_getcpu,__vdso_getcpu@LINUX_2.6
 
 #elif defined(__aarch64__)
+
+.section .vdso.text, "a", @progbits
+PAGE_ALIGN
 
 #define SYSCALL(which)          \
         mov     x8, which;      \

@@ -8,6 +8,22 @@ static bool supports_txcp;
 /**
  * Return the detected, known microarchitecture of this CPU, or don't
  * return; i.e. never return UnknownCpu.
+ *
+ * Another way to do this would be to read the pmu type under
+ * /sys/devices/.../caps/pmu_name. There are tradeoffs:
+ *   * With the current approach, rr works with old kernels that haven't
+ * been updated with specific knowledge of the CPU type. Reading
+ * `pmu_name`, rr would not work.
+ *   * Reading `pmu_name`, rr would work with new CPUs that use an
+ * existing PMU type, if the kernel is new enough to know about those
+ * CPUs. With the current approach users have to have an rr that has
+ * been updated for those CPUs.
+ * Assuming that it's easier to update rr than update one's kernel,
+ * the current approach seems a little better.
+ *
+ * This detects the overall microarchitecture, which we also use
+ * as the microarchitecture identifier for the P-cores of that architecture
+ * in a hybrid setup.
  */
 static CpuMicroarch compute_cpu_microarch() {
   auto cpuid_vendor = cpuid(CPUID_GETVENDORSTRING, 0);
@@ -66,50 +82,96 @@ static CpuMicroarch compute_cpu_microarch() {
     case 0x706a0:
     case 0x506c0:
       return IntelGoldmont;
+    case 0x906c0:
+      return IntelTremont;
     case 0x706e0:
     case 0x606a0:
-      return IntelIcelake;
+    case 0x80660:
+      return IntelIceLake;
     case 0x806c0:
     case 0x806d0:
-      return IntelTigerlake;
+      return IntelTigerLake;
     case 0x806e0:
     case 0x906e0:
-      return IntelKabylake;
+      return IntelKabyLake;
     case 0xa0650:
     case 0xa0660:
-      return IntelCometlake;
+      return IntelCometLake;
     case 0xa0670:
-      return IntelRocketlake;
+      return IntelRocketLake;
     case 0x90670:
     case 0x906a0:
-      return IntelAlderlake;
+      return IntelAlderLake;
     case 0xb0670:
-      return IntelRaptorlake;
-    case 0x30f00:
-      return AMDF15R30;
-    case 0x00f10: // Naples, Whitehaven, Summit Ridge, Snowy Owl (Zen), Milan (Zen 3) (UNTESTED)
-    case 0x10f10: // Raven Ridge, Great Horned Owl (Zen) (UNTESTED)
-    case 0x10f80: // Banded Kestrel (Zen), Picasso (Zen+) (UNTESTED)
-    case 0x20f00: // Dali (Zen) (UNTESTED)
-    case 0x00f80: // Colfax, Pinnacle Ridge (Zen+) (UNTESTED)
-    case 0x30f10: // Rome, Castle Peak (Zen 2)
-    case 0x60f00: // Renoir (Zen 2) (UNTESTED)
-    case 0x70f10: // Matisse (Zen 2) (UNTESTED)
-    case 0x60f80: // Lucienne
-    case 0x90f00: // Van Gogh (Zen 2)
-      if (ext_family == 8 || ext_family == 0xa) {
+    case 0xb06a0:
+    case 0xb06f0:
+      return IntelRaptorLake;
+    case 0x806f0:
+      return IntelSapphireRapids;
+    case 0xc06f0:
+      return IntelEmeraldRapids;
+    case 0xa06d0:
+      return IntelGraniteRapids;
+    case 0xa06a0:
+      return IntelMeteorLake;
+    case 0xb06d0:
+      return IntelLunarLake;
+    case 0xb06e0:
+      return IntelGracemont;
+    case 0xb0650:
+    case 0xc0650:
+    case 0xc0660:
+      return IntelArrowLake;
+    case 0xf20:  // Piledriver
+    case 0x30f00:  // Steamroller
+      return AMDF15;
+    case 0x00f10: // A8-3530MX, Naples, Whitehaven, Summit Ridge, Snowy Owl (Zen), Milan (Zen 3) (UNTESTED)
+      if (ext_family == 8) {
         return AMDZen;
+      } else if (ext_family == 0xa) {
+        return AMDZen3;
       } else if (ext_family == 3) {
-        return AMDF15R30;
+        return AMDF15;
+      }
+      break;
+    case 0x00f80: // Colfax, Pinnacle Ridge (Zen+), Chagall (Zen3) (UNTESTED)
+      if (ext_family == 8) {
+        return AMDZen;
+      } else if (ext_family == 0xa) {
+        return AMDZen3;
+      }
+      break;
+    case 0x10f10: // Raven Ridge, Great Horned Owl (Zen) (UNTESTED)
+    case 0x10f80: // Banded Kestrel (Zen), Picasso (Zen+), 7975WX (Zen2)
+    case 0x20f00: // Dali (Zen)
+      if (ext_family == 8) {
+        return AMDZen;
+      } else if (ext_family == 0xa) {
+        return AMDZen2;
+      }
+      break;
+    case 0x30f10: // Rome, Castle Peak (Zen 2)
+    case 0x60f00: // Renoir (Zen 2), Krackan Point (Zen 5) (EXPERIMENTAL)
+    case 0x70f10: // Matisse (Zen 2)
+    case 0x60f80: // Lucienne (Zen 2)
+    case 0x90f00: // Van Gogh (Zen 2)
+      if (ext_family == 8) {
+        return AMDZen2;
+      } else if (ext_family == 0xb) {
+        return AMDZen5;
       }
       break;
     case 0x20f10: // Vermeer (Zen 3)
     case 0x50f00: // Cezanne (Zen 3)
     case 0x40f40: // Rembrandt (Zen 3+)
+      return AMDZen3;
     case 0x60f10: // Raphael (Zen 4)
-      if (ext_family == 0xa) {
-        return AMDZen;
-      }
+    case 0x70f40: // Phoenix (Zen 4)
+    case 0x70f50: // Hawk Point (Zen 4)
+      return AMDZen4;
+    case 0x20f40: // Strix Point (Zen 5)
+    case 0x70f00: // Strix Halo (Zen 5)
+      return AMDZen5;
     default:
       break;
   }
@@ -123,8 +185,76 @@ static CpuMicroarch compute_cpu_microarch() {
   return UnknownCpu; // not reached
 }
 
-static std::vector<CpuMicroarch> compute_cpu_microarchs() {
-  return { compute_cpu_microarch() };
+static vector<CPUInfo> compute_cpus_info() {
+  vector<CPUInfo> result;
+  auto groups = CPUs::get().cpu_groups();
+  if (groups.empty()) {
+    // Only one kind of CPU core.
+    result.push_back({compute_cpu_microarch(), PERF_TYPE_RAW});
+    return result;
+  }
+
+  for (int cpu : CPUs::get().initial_affinity()) {
+    if (cpu < static_cast<int>(result.size()) &&
+        result[cpu].microarch != UnknownCpu) {
+      // This cpu belongs to a group we already computed the microarch for.
+      // Using groups like this lets us avoid having to schedule this thread
+      // on every single CPU in the system.
+      continue;
+    }
+    while (static_cast<int>(result.size()) < cpu) {
+      result.push_back({UnknownCpu, PERF_TYPE_RAW});
+    }
+    if (!CPUs::set_affinity_to_cpu(cpu)) {
+      FATAL() << "Can't set affinity to previously allowed CPU";
+    }
+    CpuMicroarch uarch = compute_cpu_microarch();
+    // May be overwritten below if this is part of a known hybrid core grouping.
+    result.push_back({uarch, PERF_TYPE_RAW});
+    // Fill in `result` for all CPUs in the same group as the current CPU.
+    // This avoids having to schedule this thread on every single CPU in the
+    // system.
+    for (auto group : groups) {
+      if (group.start_cpu <= cpu && cpu < group.end_cpu) {
+        result.resize(group.end_cpu);
+        if (group.name == "atom") {
+          switch (uarch) {
+          case IntelAlderLake:
+          case IntelRaptorLake:
+            uarch = IntelGracemont;
+            break;
+          case IntelMeteorLake:
+            uarch = IntelCrestmont;
+            break;
+          case IntelLunarLake:
+          case IntelArrowLake:
+            // Some Arrow Lakes use Crestmont E-cores maybe? Hopefully doesn't matter
+            // for the PMU.
+            uarch = IntelSkymont;
+            break;
+          default:
+            FATAL() << "Atom architecture detected but not known for " << uarch;
+          }
+        } else if (group.name == "lowpower") {
+          switch (uarch) {
+          case IntelArrowLake:
+            uarch = IntelCrestmont;
+            break;
+          default:
+            FATAL() << "Lowpower architecture detected but not known for " << uarch;
+          }
+        } else if (group.name != "core") {
+          FATAL() << "Hybrid architecture group name not known: " << group.name;
+        }
+        for (int i = group.start_cpu; i < group.end_cpu; ++i) {
+          result[i] = {uarch, group.type};
+        }
+        break;
+      }
+    }
+  }
+  CPUs::get().restore_initial_affinity();
+  return result;
 }
 
 static void check_for_kvm_in_txcp_bug(const perf_event_attrs &perf_attr) {
@@ -287,6 +417,8 @@ static void check_for_xen_pmi_bug(const perf_event_attrs &perf_attr) {
              "virtualization bug.\n"
              "Aborting. Retry with -F to override, but it will probably\n"
              "fail.";
+    } else {
+      cpu_improperly_configured = true;
     }
   }
 }
@@ -313,10 +445,14 @@ static void check_for_zen_speclockmap() {
       LOG(debug) << "SpecLockMap is disabled";
     } else {
       LOG(debug) << "SpecLockMap is not disabled";
-      fprintf(stderr,
-              "On Zen CPUs, rr will not work reliably unless you disable the "
-              "hardware SpecLockMap optimization.\nFor instructions on how to "
-              "do this, see https://github.com/rr-debugger/rr/wiki/Zen\n");
+      if (!Flags::get().force_things) {
+        CLEAN_FATAL() <<
+                "On Zen CPUs, rr will not work reliably unless you disable the "
+                "hardware SpecLockMap optimization.\nFor instructions on how to "
+                "do this, see https://github.com/rr-debugger/rr/wiki/Zen\n";
+      } else {
+        cpu_improperly_configured = true;
+      }
     }
   }
 }
@@ -339,8 +475,8 @@ static void check_for_freeze_on_smi() {
     LOG(debug) << "freeze_on_smi is set";
   } else if (freeze_on_smi == '0') {
     LOG(warn) << "freeze_on_smi is not set";
-    if (!Flags::get().suppress_environment_warnings) {
-      fprintf(stderr,
+    if (!Flags::get().force_things) {
+      CLEAN_FATAL() <<
               "Freezing performance counters on SMIs should be enabled for maximum rr\n"
               "reliability on Comet Lake and later CPUs. To manually enable this setting, run\n"
               "\techo 1 | sudo tee /sys/devices/cpu/freeze_on_smi\n"
@@ -348,34 +484,32 @@ static void check_for_freeze_on_smi() {
               "'w /sys/devices/cpu/freeze_on_smi - - - - 1' into /etc/tmpfiles.d/10-rr.conf\n"
               "to automatically apply this setting on every reboot.\n"
               "See 'man 5 sysfs', 'man 5 tmpfiles.d'.\n"
-              "If you are seeing this message, the setting has not been enabled.\n");
+              "If you are seeing this message, the setting has not been enabled.\n";
+    } else {
+      cpu_improperly_configured = true;
     }
   } else {
     LOG(warn) << "Unrecognized freeze_on_smi value " << freeze_on_smi;
   }
 }
 
+// Must be run on the CPU where we're checking for bugs.
 static void check_for_arch_bugs(perf_event_attrs &perf_attr) {
-  DEBUG_ASSERT(rr::perf_attrs.size() == 1);
   CpuMicroarch uarch = (CpuMicroarch)perf_attr.bug_flags;
   if (uarch >= FirstIntel && uarch <= LastIntel) {
     check_for_kvm_in_txcp_bug(perf_attr);
     check_for_xen_pmi_bug(perf_attr);
   }
-  if (uarch >= IntelCometlake && uarch <= LastIntel) {
+  if (uarch >= IntelCometLake && uarch <= LastIntel) {
     check_for_freeze_on_smi();
   }
-  if (uarch == AMDZen) {
+  if (uarch >= AMDZen && uarch <= LastAMD) {
     check_for_zen_speclockmap();
   }
 }
 
-static void post_init_pmu_uarchs(std::vector<PmuConfig> &pmu_uarchs)
-{
-  if (pmu_uarchs.size() != 1) {
-    CLEAN_FATAL() << "rr only support a single PMU on x86, "
-                  << pmu_uarchs.size() << " specified.";
-  }
+static void post_init_pmu_uarchs(std::vector<PmuConfig> &) {
+
 }
 
 static bool always_recreate_counters(const perf_event_attrs &perf_attr) {
@@ -398,10 +532,9 @@ static void arch_check_restricted_counter() {
 }
 
 template <typename Arch>
-void PerfCounters::reset_arch_extras() {
-  DEBUG_ASSERT(rr::perf_attrs.size() == 1);
+void PerfCounters::reset_arch_extras(int pmu_index) {
   if (supports_txcp) {
-    struct perf_event_attr attr = rr::perf_attrs[0].ticks;
+    struct perf_event_attr attr = rr::perf_attrs[pmu_index].ticks;
     if (has_kvm_in_txcp_bug) {
       // IN_TXCP isn't going to work reliably. Assume that HLE/RTM are not
       // used,

@@ -41,22 +41,34 @@ static CpuMicroarch compute_cpu_microarch(const CPUID &cpuid) {
       return ARMCortexA75;
     case 0xd0b:
       return ARMCortexA76;
-    case 0xd0c:
-      return ARMNeoverseN1;
     case 0xd0d:
       return ARMCortexA77;
-    case 0xd40:
-      return ARMNeoverseV1;
     case 0xd41:
     case 0xd4b: // ARM Cortex A78C
       return ARMCortexA78;
     case 0xd44:
     case 0xd4c: // ARM Cortex X1C
       return ARMCortexX1;
+    case 0xd80:
+      return ARMCortexA520;
+    case 0xd81:
+      return ARMCortexA720;
+    case 0xd0c:
+      return ARMNeoverseN1;
     case 0xd49:
       return ARMNeoverseN2;
+    case 0xd8e:
+      return ARMNeoverseN3;
     case 0xd4a:
       return ARMNeoverseE1;
+    case 0xd40:
+      return ARMNeoverseV1;
+    case 0xd4f:
+      return ARMNeoverseV2;
+    case 0xd83:
+      return ARMNeoverseV3AE;
+    case 0xd84:
+      return ARMNeoverseV3;
     }
     break;
   case 0x51: // Qualcomm
@@ -69,16 +81,34 @@ static CpuMicroarch compute_cpu_microarch(const CPUID &cpuid) {
       return ARMCortexA76;
     case 0x805:
       return ARMCortexA55;
+    case 0x001:
+      return QualcommOryonX1;
     }
     break;
   case 0x61: // Apple
     switch (cpuid.part) {
     case 0x22:
     case 0x24:
+    case 0x28:
       return AppleM1Icestorm;
     case 0x23:
     case 0x25:
+    case 0x29:
       return AppleM1Firestorm;
+    case 0x32:
+    case 0x34:
+    case 0x38:
+      return AppleM2Blizzard;
+    case 0x33:
+    case 0x35:
+    case 0x39:
+      return AppleM2Avalanche;
+    }
+    break;
+  case 0xc0: // Ampere
+    switch (cpuid.part) {
+    case 0xac3:
+      return AmpereOne;
     }
     break;
   }
@@ -232,8 +262,9 @@ static inline void get_cpuinfo_procfs(std::vector<CPUID> &res)
   reset();
 }
 
-static std::vector<CpuMicroarch> compute_cpu_microarchs() {
-  std::vector<CPUID> cpuids;
+static vector<CPUInfo> compute_cpus_info() {
+  vector<CPUInfo> result;
+  vector<CPUID> cpuids;
   get_cpuinfo_sysfs(cpuids);
   if (cpuids.empty()) {
     LOG(warn) << "Unable to read CPU type from sysfs, trying procfs instead.";
@@ -256,13 +287,13 @@ static std::vector<CpuMicroarch> compute_cpu_microarchs() {
     }
   }
   if (single_uarch) {
-    return { compute_cpu_microarch(cpuid0) };
+    result.push_back({compute_cpu_microarch(cpuid0), PERF_TYPE_RAW});
+    return result;
   }
-  std::vector<CpuMicroarch> uarchs;
   for (auto &cpuid : cpuids) {
-    uarchs.push_back(compute_cpu_microarch(cpuid));
+    result.push_back({compute_cpu_microarch(cpuid), PERF_TYPE_RAW});
   }
-  return uarchs;
+  return result;
 }
 
 static void arch_check_restricted_counter() {
@@ -381,10 +412,17 @@ static void post_init_pmu_uarchs(std::vector<PmuConfig> &pmu_uarchs)
 }
 
 template <>
-void PerfCounters::reset_arch_extras<ARM64Arch>() {
-  // LL/SC can't be recorded reliably. Start a counter to detect
-  // any usage, such that we can give an intelligent error message.
-  struct perf_event_attr attr = perf_attrs[pmu_index].llsc_fail;
-  attr.sample_period = 0;
-  fd_strex_counter = start_counter(tid, fd_ticks_interrupt, &attr);
+void PerfCounters::reset_arch_extras<ARM64Arch>(int pmu_index) {
+  // Currently all the Aarch64 PMU counters that count exclusive
+  // loads or stores count speculative execution whether or not
+  // those instructions retired. This is inherently inaccurate;
+  // there is often a conditional branch of the form "should we use
+  // LDXR/STXR?" guarding these instructions, and if that branch is
+  // mispredicted, we can get false positives here :-(. So we can't
+  // really do this.
+  if (0) {
+    struct perf_event_attr attr = perf_attrs[pmu_index].llsc_fail;
+    attr.sample_period = 0;
+    fd_strex_counter = start_counter(tid, fd_ticks_interrupt, &attr);
+  }
 }

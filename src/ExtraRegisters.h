@@ -8,7 +8,7 @@
 
 #include <vector>
 
-#include "GdbRegister.h"
+#include "GdbServerRegister.h"
 #include "Registers.h"
 #include "kernel_abi.h"
 
@@ -24,12 +24,12 @@ struct XSaveLayout;
  * Task is responsible for creating meaningful values of this class.
  *
  * The only reason this class has an arch() is to enable us to
- * interpret GdbRegister.
+ * interpret GdbServerRegister.
  */
 class ExtraRegisters {
 public:
   // Create empty (uninitialized/unknown registers) value
-  ExtraRegisters(SupportedArch arch = SupportedArch(-1))
+  ExtraRegisters(SupportedArch arch = x86)
       : format_(NONE), arch_(arch) {}
   enum Format { NONE,
   /**
@@ -58,11 +58,12 @@ public:
    */
   XSAVE,
   /**
-   * Stores the content of the NT_FPREGS regset. The format depends on the
-   * architecture. It is given by Arch::user_fpregs_struct for the appropriate
-   * architecture.
+   * Stores the content of the NT_FPREGS regset for Aarch64.
+   * The first sizeof(ARM64Arch::user_fpregs_struct) bytes (or less) are
+   * a ARM64Arch::user_fpregs_struct.
+   * The next 8 bytes after that (if present) are TPIDR.
    */
-  NT_FPR };
+  AARCH64_FPR };
 
   // Set values from raw data, with the given XSAVE layout. Returns false
   // if this could not be done.
@@ -105,13 +106,13 @@ public:
    * Like |Registers::read_register()|, except attempts to read
    * the value of an "extra register" (floating point / vector).
    */
-  size_t read_register(uint8_t* buf, GdbRegister regno, bool* defined) const;
+  size_t read_register(uint8_t* buf, GdbServerRegister regno, bool* defined) const;
 
   /**
    * Like |Registers::write_register()|, except attempts to write
    * the value of an "extra register" (floating point / vector).
    */
-  bool write_register(GdbRegister regno, const void* value, size_t value_size);
+  bool write_register(GdbServerRegister regno, const void* value, size_t value_size);
 
   /**
    * Get a user_fpregs_struct for a particular Arch from these ExtraRegisters.
@@ -155,18 +156,23 @@ public:
    * information to verify that the registers definitely don't match.
    * The register files must have the same arch.
    */
-  static bool compare_register_files(ReplayTask* t, const char* name1,
-                                     const ExtraRegisters& reg1, const char* name2,
-                                     const ExtraRegisters& reg2,
-                                     MismatchBehavior mismatch_behavior);
+  Registers::Comparison compare_with(const ExtraRegisters& reg2) const {
+    Registers::Comparison result;
+    compare_internal(reg2, result);
+    return result;
+  }
+
+  bool matches(const ExtraRegisters& reg2) const {
+    Registers::Comparison result;
+    result.store_mismatches = false;
+    compare_internal(reg2, result);
+    return !result.mismatch_count;
+  }
 
 private:
   friend class Task;
 
-  static bool compare_register_files_internal(const char* name1,
-                                              const ExtraRegisters& reg1, const char* name2,
-                                              const ExtraRegisters& reg2,
-                                              MismatchBehavior mismatch_behavior);
+  void compare_internal(const ExtraRegisters& reg2, Registers::Comparison& result) const;
 
   Format format_;
   SupportedArch arch_;

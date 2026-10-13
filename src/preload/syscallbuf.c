@@ -51,8 +51,6 @@
 #include <asm/errno.h>
 #include <asm/ioctls.h>
 #include <asm/poll.h>
-#include <asm/signal.h>
-#include <asm/siginfo.h>
 #include <asm/stat.h>
 #include <asm/statfs.h>
 #include <linux/eventpoll.h>
@@ -66,21 +64,20 @@
 #include <linux/perf_event.h>
 #include <linux/ptrace.h>
 #include <linux/quota.h>
-#include <linux/resource.h>
 #include <linux/stat.h>
-#include <linux/socket.h>
-#include <linux/stat.h>
-#include <linux/time.h>
 #include <linux/types.h>
-#include <linux/uio.h>
 #include <linux/un.h>
 #include <linux/utsname.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <syscall.h>
 #include <sysexits.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "preload_interface.h"
@@ -106,9 +103,25 @@ struct btrfs_ioctl_clone_range_args {
 #ifndef MADV_FREE
 #define MADV_FREE 8
 #endif
+#ifndef MADV_COLD
+#define MADV_COLD 20
+#endif
 
 #ifndef GRND_NONBLOCK
 #define GRND_NONBLOCK 1
+#endif
+
+#ifndef SOL_IP
+#define SOL_IP 0
+#endif
+#ifndef SOL_IPV6
+#define SOL_IPV6 41
+#endif
+#ifndef IPT_SO_SET_REPLACE
+#define IPT_SO_SET_REPLACE 64
+#endif
+#ifndef IPV6T_SO_SET_REPLACE
+#define IPV6T_SO_SET_REPLACE 64
 #endif
 
 struct rr_rseq {
@@ -124,6 +137,13 @@ struct rr_rseq {
 #undef memcpy
 #endif
 #define memcpy you_must_use_local_memcpy
+
+/* POSIX defines it as int while glibc defines it as size_t */
+#if defined (__GLIBC__) || defined (__ANDROID__)
+typedef size_t rr_iovlen_t;
+#else
+typedef int rr_iovlen_t;
+#endif
 
 static long _traced_init_syscall(int syscallno, long a0, long a1, long a2,
                                  long a3, long a4, long a5)
@@ -184,6 +204,17 @@ static struct syscallbuf_hdr* buffer_hdr(void) {
 }
 
 /**
+ * Return a pointer to what may be the next syscall record.
+ *
+ * THIS POINTER IS NOT GUARANTEED TO BE VALID!!!  Caveat emptor.
+ */
+inline static struct syscallbuf_record* next_record(
+    struct syscallbuf_hdr* hdr) {
+  uintptr_t next = (uintptr_t)hdr + sizeof(*hdr) + hdr->num_rec_bytes;
+  return (struct syscallbuf_record*)next;
+}
+
+/**
  * Return a pointer to the byte just after the last valid syscall record in
  * the buffer.
  */
@@ -215,6 +246,7 @@ static void local_memcpy(void* dest, const void* source, int n) {
 #elif defined(__aarch64__)
   long c1;
   long c2;
+  long n_long = n;
   __asm__ __volatile__("subs %4, %2, 16\n\t"
                        "b.lt 2f\n\t"
                        "1:\n\t"
@@ -240,7 +272,7 @@ static void local_memcpy(void* dest, const void* source, int n) {
                        "ldrb %w3, [%1]\n\t"
                        "strb %w3, [%0]\n\t"
                        "3:\n\t"
-                       : "+r"(dest), "+r"(source), "+r"(n), "=&r"(c1), "=&r"(c2)
+                       : "+r"(dest), "+r"(source), "+r"(n_long), "=&r"(c1), "=&r"(c2)
                        :
                        : "cc", "memory");
 #else
@@ -262,8 +294,9 @@ static void local_memset(void* dest, uint8_t c, int n) {
                        :
                        : "cc", "memory");
 #elif defined(__aarch64__)
-  double v1;
+  double v1 __attribute__((vector_size(16)));
   long n2;
+  long n_long = n;
   __asm__ __volatile__("subs %4, %2, 32\n\t"
                        "b.lt 2f\n\t"
                        "dup %3.16b, %w0\n"
@@ -279,7 +312,7 @@ static void local_memset(void* dest, uint8_t c, int n) {
                        "subs %2, %2, #1\n\t"
                        "b.ne 3b\n"
                        "4:\n\t"
-                       : "+r"(c), "+r"(dest), "+r"(n), "=x"(v1), "=r"(n2)
+                       : "+r"(c), "+r"(dest), "+r"(n_long), "=x"(v1), "=r"(n2)
                        :
                        : "cc", "memory");
 #else
@@ -628,7 +661,7 @@ static void rrcall_init_buffers(struct rrcall_init_buffers_params* args) {
  * Return a counter that generates a signal targeted at this task
  * every time the task is descheduled |nr_descheds| times.
  */
-static int open_desched_event_counter(size_t nr_descheds, pid_t tid) {
+static int open_desched_event_counter(pid_t tid) {
   struct perf_event_attr attr;
   int tmp_fd, fd;
   struct rr_f_owner_ex own;
@@ -636,9 +669,24 @@ static int open_desched_event_counter(size_t nr_descheds, pid_t tid) {
   local_memset(&attr, 0, sizeof(attr));
   attr.size = sizeof(attr);
   attr.type = PERF_TYPE_SOFTWARE;
-  attr.config = PERF_COUNT_SW_CONTEXT_SWITCHES;
+  switch (globals.context_switch_event_strategy) {
+    case STRATEGY_SW_CONTEXT_SWITCHES:
+      attr.config = PERF_COUNT_SW_CONTEXT_SWITCHES;
+      break;
+    case STRATEGY_RECORD_SWITCH:
+      attr.config = PERF_COUNT_SW_DUMMY;
+      attr.watermark = 1;
+      attr.context_switch = 1;
+      attr.wakeup_watermark = 1;
+      attr.exclude_kernel = 1;
+      attr.exclude_guest = 1;
+      break;
+    default:
+      fatal("Unknown strategy");
+      break;
+  }
   attr.disabled = 1;
-  attr.sample_period = nr_descheds;
+  attr.sample_period = 1;
 
   tmp_fd = privileged_traced_perf_event_open(&attr, 0 /*self*/, -1 /*any cpu*/,
                                              -1, 0);
@@ -692,7 +740,7 @@ static void init_thread(void) {
 
   /* NB: we want this setup emulated during replay. */
   thread_locals->desched_counter_fd =
-      open_desched_event_counter(1, privileged_traced_gettid());
+      open_desched_event_counter(privileged_traced_gettid());
 
   args.desched_counter_fd = thread_locals->desched_counter_fd;
 
@@ -760,6 +808,7 @@ static void __attribute__((constructor)) init_process(void) {
   extern RR_HIDDEN void _syscall_hook_trampoline_48_3d_01_f0_ff_ff(void);
   extern RR_HIDDEN void _syscall_hook_trampoline_48_3d_00_f0_ff_ff(void);
   extern RR_HIDDEN void _syscall_hook_trampoline_3d_00_f0_ff_ff(void);
+  extern RR_HIDDEN void _syscall_hook_trampoline_48_85_c0(void);
   extern RR_HIDDEN void _syscall_hook_trampoline_48_8b_3c_24(void);
   extern RR_HIDDEN void _syscall_hook_trampoline_48_89_45_f8(void);
   extern RR_HIDDEN void _syscall_hook_trampoline_48_89_c3(void);
@@ -781,9 +830,13 @@ static void __attribute__((constructor)) init_process(void) {
   extern RR_HIDDEN void _syscall_hook_trampoline_b8_11_01_00_00(void);
   extern RR_HIDDEN void _syscall_hook_trampoline_b8_ca_00_00_00(void);
   extern RR_HIDDEN void _syscall_hook_trampoline_be_18_00_00_00(void);
+  extern RR_HIDDEN void _syscall_hook_trampoline_4c_8b_0d(void);
   extern RR_HIDDEN void _syscall_hook_trampoline_48_89_e5(void);
   extern RR_HIDDEN void _syscall_hook_trampoline_48_89_fb(void);
+  extern RR_HIDDEN void _syscall_hook_trampoline_48_8b_45_10(void);
+  extern RR_HIDDEN void _syscall_hook_trampoline_48_8b_44_24_10(void);
   extern RR_HIDDEN void _syscall_hook_trampoline_48_8d_b3_f0_08_00_00(void);
+  extern RR_HIDDEN void _syscall_hook_trampoline_nops(void);
 
 #define MOV_RDX_VARIANTS \
   MOV_RDX_TO_REG(48, d0) \
@@ -828,6 +881,11 @@ static void __attribute__((constructor)) init_process(void) {
       5,
       { 0x3d, 0x00, 0xf0, 0xff, 0xff },
       (uintptr_t)_syscall_hook_trampoline_3d_00_f0_ff_ff },
+    /* Some application has'syscall' followed by 'test %rax,%rax' */
+    { 0,
+      3,
+      { 0x48, 0x85, 0xc0 },
+      (uintptr_t)_syscall_hook_trampoline_48_85_c0 },
     /* Many glibc syscall wrappers (e.g. read) have 'syscall' followed
      * by
      * mov (%rsp),%rdi (in glibc-2.18-16.fc20.x86_64) */
@@ -936,6 +994,12 @@ static void __attribute__((constructor)) init_process(void) {
       { 0x##rex, 0x89, 0x##op }, \
       (uintptr_t)_syscall_hook_trampoline_##rex##_89_##op },
     MOV_RDX_VARIANTS
+    /* Some application has RDTSC followed by 'mov xxxxxx(%rip),%r9' */
+    {
+      PATCH_NO_MATCH_TRAILING_4_BYTES,
+      7,
+      { 0x4c, 0x8b, 0x0d },
+      (uintptr_t)_syscall_hook_trampoline_4c_8b_0d },
     /* Some application has RDTSC followed by 'shl $32,%rdx' */
     {
       0,
@@ -965,7 +1029,7 @@ static void __attribute__((constructor)) init_process(void) {
       3,
       { 0x4c, 0x89, 0xff },
       (uintptr_t)_syscall_hook_trampoline_4c_89_ff },
-    /* Some application has 'mov $0xffffffff,%r9' followed by 'syscall' */
+    /* Some application has 'mov $0xffffffffffffffff,%r9' followed by 'syscall' */
     { PATCH_SYSCALL_INSTRUCTION_IS_LAST,
       7,
       { 0x49, 0xc7, 0xc1, 0xff, 0xff, 0xff, 0xff },
@@ -1002,6 +1066,22 @@ static void __attribute__((constructor)) init_process(void) {
       3,
       { 0x48, 0x89, 0xfb },
       (uintptr_t)_syscall_hook_trampoline_48_89_fb },
+    /* glibc-2.41-5.fc42.x86_64 has 'mov 0x10(%rbp),%rax' followed by 'syscall' */
+    { PATCH_SYSCALL_INSTRUCTION_IS_LAST,
+      4,
+      { 0x48, 0x8b, 0x45, 0x10 },
+      (uintptr_t)_syscall_hook_trampoline_48_8b_45_10 },
+    /* 2.41-12+deb13u3 has 'mov 0x10(%rsp),%rax' followed by 'syscall' */
+    { PATCH_SYSCALL_INSTRUCTION_IS_LAST,
+      5,
+      { 0x48, 0x8b, 0x44, 0x24, 0x10},
+      (uintptr_t)_syscall_hook_trampoline_48_8b_44_24_10 },
+    /* Support explicit 5 byte nop (`nopl 0(%ax, %ax, 1)`) before 'rdtsc' or syscall (may ignore interfering branches) */
+    { PATCH_SYSCALL_INSTRUCTION_IS_LAST |
+      PATCH_IS_NOP_INSTRUCTIONS,
+      5,
+      { 0x0f, 0x1f, 0x44, 0x00, 0x00 },
+      (uintptr_t)_syscall_hook_trampoline_nops }
   };
 #elif defined(__aarch64__)
   extern RR_HIDDEN void _syscall_hook_trampoline_raw(void);
@@ -1498,6 +1578,7 @@ static void memcpy_input_parameter(void* buf, void* src, int size) {
 #elif defined(__aarch64__)
   long c1;
   long c2;
+  long size_long = size;
   unsigned char *globals_in_replay = rr_page_replay_flag_addr();
   __asm__ __volatile__("ldrb %w3, [%5]\n\t"
                        "cmp %3, #0\n\t" // eq -> record
@@ -1531,7 +1612,7 @@ static void memcpy_input_parameter(void* buf, void* src, int size) {
                        "mov %4, xzr\n\t"
                        "mov %1, xzr\n\t"
                        : "+r"(buf), "+r"(src),
-                         "+r"(size), "=&r"(c1), "=&r"(c2), "+r"(globals_in_replay)
+                         "+r"(size_long), "=&r"(c1), "=&r"(c2), "+r"(globals_in_replay)
                        :
                        : "cc", "memory");
 #else
@@ -1546,7 +1627,7 @@ static void memcpy_input_parameter(void* buf, void* src, int size) {
  */
 static void rdtsc_recording_only(uint32_t buf[2]) {
   unsigned char tmp_in_replay = *rr_page_replay_flag_addr();
-  __asm__ __volatile__("test %%eax,%%eax\n\t"
+  __asm__ __volatile__("test %%al,%%al\n\t"
                        "jne 1f\n\t"
                        "rdtsc\n\t"
                        "mov %%eax,(%1)\n\t"
@@ -1703,13 +1784,18 @@ static long sys_clock_gettime(struct syscall_info* call) {
 
 #ifdef SYS_clock_gettime64
 
+struct kernel_timespec {
+  long long tv_sec;
+  long long tv_nsec;
+};
+
 static long sys_clock_gettime64(struct syscall_info* call) {
   const int syscallno = SYS_clock_gettime64;
   __kernel_clockid_t clk_id = (__kernel_clockid_t)call->args[0];
-  struct __kernel_timespec* tp = (struct __kernel_timespec*)call->args[1];
+  struct kernel_timespec* tp = (struct kernel_timespec*)call->args[1];
 
   void* ptr = prep_syscall();
-  struct __kernel_timespec* tp2 = NULL;
+  struct kernel_timespec* tp2 = NULL;
   long ret;
 
   assert(syscallno == call->no);
@@ -2306,24 +2392,21 @@ static long sys_madvise(struct syscall_info* call) {
   long ret;
 
   switch (advice) {
-    // Whitelist advice values that we know are OK to pass through to the
-    // kernel directly.
+    // Advice values that we buffer and are ok to pass through to the kernel
+    // directly.
     case MADV_NORMAL:
     case MADV_RANDOM:
     case MADV_SEQUENTIAL:
     case MADV_WILLNEED:
-    case MADV_DONTNEED:
     case MADV_MERGEABLE:
     case MADV_UNMERGEABLE:
     case MADV_HUGEPAGE:
     case MADV_NOHUGEPAGE:
     case MADV_DONTDUMP:
     case MADV_DODUMP:
-      break;
+    // Advice values that we buffer but require special handling.
+    case MADV_DONTNEED:
     case MADV_FREE:
-      // See record_syscall. We disallow MADV_FREE because it creates
-      // nondeterminism.
-      advice = -1;
       break;
     default:
       return traced_raw_syscall(call);
@@ -2335,6 +2418,24 @@ static long sys_madvise(struct syscall_info* call) {
 
   if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
     return traced_raw_syscall(call);
+  }
+
+  if (advice == MADV_FREE) {
+    // See record_syscall. We disallow MADV_FREE because it creates
+    // nondeterminism. NB: Since we veto this, we *don't* need to
+    // execute it during replay.
+    ret = privileged_untraced_syscall3(syscallno, addr, length, -1);
+    return commit_raw_syscall(syscallno, ptr, ret);
+  } else if (advice == MADV_DONTNEED) {
+    ret = privileged_untraced_syscall3(syscallno, addr, length, MADV_COLD);
+    commit_raw_syscall(syscallno, ptr, ret);
+    if (ret < 0) {
+      return traced_raw_syscall(call);
+    }
+    ptr = prep_syscall();
+    if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+      return traced_raw_syscall(call);
+    }
   }
 
   /* Ensure this syscall happens during replay. In particular MADV_DONTNEED
@@ -2382,6 +2483,12 @@ static long sys_mprotect(struct syscall_info* call) {
 }
 
 static int supported_open(const char* file_name, int flags) {
+  if (!file_name) {
+    /* XXXkhuey what about other bogus but non-null pointers?
+       We're going to crash below. */
+    return 0;
+  }
+
   if (is_gcrypt_deny_file(file_name)) {
     /* This needs to be a traced syscall. We want to return an
        open file even if the file doesn't exist and the untraced syscall
@@ -2514,6 +2621,40 @@ static long sys_openat(struct syscall_info* call) {
   ret = commit_raw_syscall(syscallno, ptr, ret);
   return check_file_open_ok(call, ret, state);
 }
+
+#if defined(SYS_openat2)
+static long sys_openat2(struct syscall_info* call) {
+  if (force_traced_syscall_for_chaos_mode()) {
+    /* Opening a FIFO could unblock a higher priority task */
+    return traced_raw_syscall(call);
+  }
+
+  const int syscallno = SYS_openat2;
+  int dirfd = call->args[0];
+  const char* pathname = (const char*)call->args[1];
+  struct open_how *how = (struct open_how *)call->args[2];
+  size_t how_size = call->args[3];
+
+  void* ptr;
+  long ret;
+
+  assert(syscallno == call->no);
+
+  if (!supported_open(pathname, how->flags)) {
+    return traced_raw_syscall(call);
+  }
+
+  ptr = prep_syscall();
+  if (!start_commit_buffered_syscall(syscallno, ptr, MAY_BLOCK)) {
+    return traced_raw_syscall(call);
+  }
+
+  ret = untraced_syscall4(syscallno, dirfd, pathname, how, how_size);
+  struct check_open_state state = capture_check_open_state();
+  ret = commit_raw_syscall(syscallno, ptr, ret);
+  return check_file_open_ok(call, ret, state);
+}
+#endif
 
 #if defined(SYS_poll) || defined(SYS_ppoll)
 /**
@@ -3114,36 +3255,6 @@ static long sys_recvfrom(struct syscall_info* call) {
 
 #ifdef SYS_recvmsg
 
-/* These macros are from musl Copyright © 2005-2020 Rich Felker, et al. (MIT LICENSE) */
-#define __CMSG_LEN(cmsg) (((cmsg)->cmsg_len + sizeof(long) - 1) & ~(long)(sizeof(long) - 1))
-#define __CMSG_NEXT(cmsg) ((unsigned char *)(cmsg) + __CMSG_LEN(cmsg))
-#define __MHDR_END(mhdr) ((unsigned char *)(mhdr)->msg_control + (mhdr)->msg_controllen)
-
-#define CMSG_DATA(cmsg) ((unsigned char *) (((struct cmsghdr *)(cmsg)) + 1))
-#define CMSG_NXTHDR(mhdr, cmsg) ((cmsg)->cmsg_len < sizeof (struct cmsghdr) || \
-	(__CMSG_LEN(cmsg) + sizeof(struct cmsghdr) >= (unsigned long)(__MHDR_END(mhdr) - (unsigned char *)(cmsg))) \
-	? 0 : (struct cmsghdr *)__CMSG_NEXT(cmsg))
-#define CMSG_FIRSTHDR(mhdr) ((size_t) (mhdr)->msg_controllen >= sizeof (struct cmsghdr) ? (struct cmsghdr *) (mhdr)->msg_control : (struct cmsghdr *) 0)
-
-struct cmsghdr {
-  __kernel_size_t	cmsg_len;
-  int cmsg_level;
-  int cmsg_type;
-};
-
-struct msghdr /* struct user_msghdr in the kernel */ {
-  void* msg_name;
-  int msg_namelen;
-  struct iovec* msg_iov;
-  __kernel_size_t msg_iovlen;
-  void* msg_control;
-  __kernel_size_t msg_controllen;
-  unsigned int msg_flags;
-};
-
-#define SCM_RIGHTS 0x01
-#define SOL_PACKET 263
-
 static int msg_received_file_descriptors(struct msghdr* msg) {
   struct cmsghdr* cmh;
   for (cmh = CMSG_FIRSTHDR(msg); cmh; cmh = CMSG_NXTHDR(msg, cmh)) {
@@ -3172,7 +3283,7 @@ static long sys_recvmsg(struct syscall_info* call) {
   void* ptr_overwritten_end;
   void* ptr_bytes_start;
   void* ptr_end;
-  size_t i;
+  rr_iovlen_t i;
 
   assert(syscallno == call->no);
 
@@ -3229,7 +3340,6 @@ static long sys_recvmsg(struct syscall_info* call) {
 
   if (ret >= 0 && !buffer_hdr()->failed_during_preparation) {
     size_t bytes = ret;
-    size_t i;
     if (msg->msg_name) {
       local_memcpy(msg->msg_name, msg2->msg_name, msg2->msg_namelen);
     }
@@ -3340,6 +3450,11 @@ static long sys_setsockopt(struct syscall_info* call) {
   if (level == SOL_NETLINK &&
       (optname == NETLINK_RX_RING || optname == NETLINK_TX_RING)) {
     // Let rr intercept this (and probably disable it)
+    return traced_raw_syscall(call);
+  }
+  if ((level == SOL_IP && optname == IPT_SO_SET_REPLACE) ||
+      (level == SOL_IPV6 && optname == IPV6T_SO_SET_REPLACE)) {
+    // Let rr intercept this because it has output parameters :-(
     return traced_raw_syscall(call);
   }
 
@@ -3586,6 +3701,33 @@ static long sys_statx(struct syscall_info* call) {
   return commit_raw_syscall(syscallno, ptr, ret);
 }
 #endif
+
+static long sys_fstatat(struct syscall_info* call) {
+  const int syscallno = call->no;
+  stat64_t* buf = (stat64_t*)call->args[2];
+
+  /* Like stat(), not arming the desched event because it's not
+   * needed for correctness, and there are no data to suggest
+   * whether it's a good idea perf-wise. */
+  void* ptr = prep_syscall();
+  stat64_t* buf2 = NULL;
+  long ret;
+
+  if (buf) {
+    buf2 = ptr;
+    ptr += sizeof(*buf2);
+  }
+
+  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+    return traced_raw_syscall(call);
+  }
+  ret = untraced_syscall4(syscallno,
+    call->args[0], call->args[1], buf2, call->args[3]);
+  if (buf2 && ret >= 0 && !buffer_hdr()->failed_during_preparation) {
+    local_memcpy(buf, buf2, sizeof(*buf));
+  }
+  return commit_raw_syscall(syscallno, ptr, ret);
+}
 
 static long sys_quotactl(struct syscall_info* call) {
   const int syscallno = call->no;
@@ -4041,11 +4183,15 @@ static long syscall_hook_internal(struct syscall_info* call) {
     CASE(creat);
 #endif
     CASE_GENERIC_NONBLOCKING_FD(dup);
+    CASE_GENERIC_NONBLOCKING_FD(epoll_ctl);
 #if defined(SYS_epoll_wait)
 case SYS_epoll_wait:
 #endif
 case SYS_epoll_pwait:
     return sys_epoll_wait(call);
+#if defined(SYS_openat2)
+    CASE(openat2);
+#endif
 #if defined(SYS_epoll_pwait2)
     CASE(epoll_pwait2);
 #endif
@@ -4193,9 +4339,22 @@ case SYS_epoll_pwait:
     case SYS_statfs:
     case SYS_fstatfs:
       return sys_statfs(call);
+#if defined(SYS_newfstatat)
+    case SYS_newfstatat:
+#elif defined(SYS_fstatat64)
+    case SYS_fstatat64:
+#endif
+      return sys_fstatat(call);
 #undef CASE
 #undef CASE_GENERIC_NONBLOCKING
 #undef CASE_GENERIC_NONBLOCKING_FD
+    case SYS_rrcall_check_presence:
+      if (call->args[0] == RRCALL_CHECK_SYSCALLBUF_USED_OR_DISABLED &&
+          call->args[1] == 0 && call->args[2] == 0 && call->args[3] == 0 &&
+          call->args[4] == 0 && call->args[5] == 0) {
+        return 0;
+      }
+      // fallthrough
     default:
       return traced_raw_syscall(call);
   }

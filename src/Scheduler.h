@@ -106,6 +106,10 @@ public:
    * The new current() task is guaranteed to either have already been
    * runnable, or have been made runnable by a waitpid status change (in
    * which case, result.by_waitpid will be true.
+   * 
+   * After this, if Rescheduled::interrupted_by_signal is false,
+   * and there is a new current task, its is_stopped() must
+   * be true.
    */
   struct Rescheduled {
     bool interrupted_by_signal;
@@ -164,14 +168,16 @@ public:
   bool may_use_unlimited_ticks();
 
   /**
-   * Let the scheduler know that the passed task has started running
+   * Let the scheduler know that the previously stopped task has resumed.
    */
-  void started(RecordTask*) {
-    if (may_use_unlimited_ticks()) {
-      unlimited_ticks_mode = true;
-    }
-    ntasks_running++;
-  }
+  void started_task(RecordTask* t);
+
+  /**
+   * Let the scheduler know that the previously running task has reached a kernel stop
+   * (typically a ptrace stop). Tasks that are blocked but not in a stop
+   * are still "running" for our purposes here.
+   */
+  void stopped_task(RecordTask* t);
 
   /**
    * Let the scheduler know that the task has entered an execve.
@@ -205,7 +211,7 @@ private:
    * the next runnable task after 't' in round-robin order.
    * Sets 'by_waitpid' to true if we determined the task was runnable by
    * calling waitpid on it and observing a state change. This task *must*
-   * be returned by get_next_thread, and is_runnable_task must not be called
+   * be returned by get_next_thread, and is_task_runnable must not be called
    * on it again until it has run.
    * Considers only tasks with priority <= priority_threshold.
    */
@@ -220,6 +226,7 @@ private:
   void maybe_pop_round_robin_task(RecordTask* t);
   void setup_new_timeslice();
   void maybe_reset_priorities(double now);
+  void notify_descheduled(RecordTask* t);
   int choose_random_priority(RecordTask* t);
   void update_task_priority_internal(RecordTask* t, int value);
   void maybe_reset_high_priority_only_intervals(double now);
@@ -285,6 +292,11 @@ private:
   pid_t in_exec_tgid;
 
   /**
+   * The number of tasks that have is_stopped_ set.
+   */
+  int ntasks_stopped;
+
+  /**
    * When true, context switch at every possible point.
    */
   bool always_switch;
@@ -298,7 +310,6 @@ private:
   bool last_reschedule_in_high_priority_only_interval;
 
   bool unlimited_ticks_mode;
-  size_t ntasks_running;
 };
 
 } // namespace rr

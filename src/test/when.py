@@ -1,68 +1,95 @@
 from util import *
 import re
 
-send_gdb('when')
-expect_gdb(re.compile(r'Current event: (\d+)'))
-t = eval(last_match().group(1));
+send_custom_command('when-end')
+expect_debugger(re.compile(r'Event at end of recording: (\d+)'))
+first_when_end_result = int(last_match().group(1))
+# Check this value after running the program for a bit.
+
+send_custom_command('when')
+expect_debugger(re.compile(r'Completed event: (\d+)'))
+t = int(last_match().group(1))
 if t < 1 or t > 10000:
     failed('ERROR in first "when"')
 
-send_gdb('when-ticks')
-expect_gdb(re.compile(r'Current tick: (\d+)'))
-ticks = eval(last_match().group(1));
+send_custom_command('when-ticks')
+expect_debugger(re.compile(r'Current tick: (\d+)'))
+ticks = int(last_match().group(1))
 if ticks != 0:
     failed('ERROR in first "when-ticks"')
 
-send_gdb('when-tid')
-expect_gdb(re.compile(r'Current tid: (\d+)'))
-tid = eval(last_match().group(1));
+send_custom_command('when-tid')
+expect_debugger(re.compile(r'Current tid: (\d+)'))
+tid = int(last_match().group(1))
 
-send_gdb('b main')
-expect_gdb('Breakpoint 1')
-send_gdb('c')
+bp = breakpoint_at_function('main')
+cont()
+expect_breakpoint_stop(bp)
 
-send_gdb('when')
-expect_gdb(re.compile(r'Current event: (\d+)'))
-t2 = eval(last_match().group(1));
+send_custom_command('when')
+expect_debugger(re.compile(r'Completed event: (\d+)'))
+t2 = int(last_match().group(1))
 if t2 < 1 or t2 > 10000:
     failed('ERROR in second "when"')
 if t2 <= t:
     failed('ERROR ... "when" failed to advance')
 
-send_gdb('when-ticks')
-expect_gdb(re.compile(r'Current tick: (\d+)'))
-ticks2 = eval(last_match().group(1));
+send_custom_command('when-ticks')
+expect_debugger(re.compile(r'Current tick: (\d+)'))
+ticks2 = int(last_match().group(1))
 if ticks2 < 0 or ticks2 > 1000000:
     failed('ERROR in second "when-ticks"')
 if ticks2 <= ticks:
     failed('ERROR ... "when-ticks" failed to advance')
 
-send_gdb('when-tid')
-expect_gdb(re.compile(r'Current tid: (\d+)'))
-tid2 = eval(last_match().group(1));
+send_custom_command('when-tid')
+expect_debugger(re.compile(r'Current tid: (\d+)'))
+tid2 = int(last_match().group(1))
 if tid2 != tid:
     failed('ERROR ... tid changed')
 
+send_custom_command('when-end')
+expect_debugger(re.compile(r'Event at end of recording: (\d+)'))
+second_when_end_result = int(last_match().group(1))
+
 # Ensure 'when' terminates a diversion
-send_gdb('call strlen("abcd")')
-send_gdb('when')
-expect_gdb(re.compile(r'Current event: (\d+)'))
-t3 = eval(last_match().group(1));
+expect_expression('(int)strlen("abcd")', 4)
+send_custom_command('when')
+expect_debugger(re.compile(r'Completed event: (\d+)'))
+t3 = int(last_match().group(1))
 if t3 != t2:
     failed('ERROR ... diversion changed event')
 
-send_gdb('call strlen("abcd")')
-send_gdb('when-ticks')
-expect_gdb(re.compile(r'Current tick: (\d+)'))
-ticks3 = eval(last_match().group(1));
+expect_expression('(int)strlen("abcd")', 4)
+send_custom_command('when-ticks')
+expect_debugger(re.compile(r'Current tick: (\d+)'))
+ticks3 = int(last_match().group(1))
 if ticks3 != ticks2:
     failed('ERROR ... diversion changed ticks')
 
-send_gdb('call strlen("abcd")')
-send_gdb('when-tid')
-expect_gdb(re.compile(r'Current tid: (\d+)'))
-tid3 = eval(last_match().group(1));
+expect_expression('(int)strlen("abcd")', 4)
+send_custom_command('when-tid')
+expect_debugger(re.compile(r'Current tid: (\d+)'))
+tid3 = int(last_match().group(1))
 if tid3 != tid2:
     failed('ERROR ... diversion changed tid')
+
+stepi()
+
+send_custom_command('when-end')
+expect_debugger(re.compile(r'Event at end of recording: (\d+)'))
+final_when_end_result = int(last_match().group(1))
+
+if first_when_end_result != second_when_end_result:
+    failed("ERROR ... first when-end result differs from second when-end result")
+if second_when_end_result != final_when_end_result:
+    failed("ERROR ... second when-end result differs from final when-end result")
+
+if t >= first_when_end_result:
+    failed("ERROR ... First when result was after when-end")
+if t3 >= first_when_end_result:
+    failed("ERROR ... Second when result was after when-end")
+if t3 >= first_when_end_result:
+    failed("ERROR ... Third when result was after when-end")
 
 ok()

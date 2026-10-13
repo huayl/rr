@@ -3,6 +3,7 @@
 #ifndef RR_RECORD_TASK_H_
 #define RR_RECORD_TASK_H_
 
+#include "ContextSwitchEvent.h"
 #include "Registers.h"
 #include "Task.h"
 #include "TraceFrame.h"
@@ -77,7 +78,7 @@ public:
   virtual void post_wait_clone(Task* cloned_from, int flags) override;
   virtual void on_syscall_exit(int syscallno, SupportedArch arch,
                                const Registers& regs) override;
-  virtual bool will_resume_execution(ResumeRequest, WaitRequest, TicksRequest,
+  virtual void will_resume_execution(ResumeRequest, WaitRequest, TicksRequest,
                                      int /*sig*/) override;
   virtual void did_wait() override;
 
@@ -133,6 +134,8 @@ public:
    * If necessary, signal the ptracer that this task has exited.
    */
   void do_ptrace_exit_stop(WaitStatus exit_status);
+
+  void record_exit_trace_event(WaitStatus exit_status);
   /**
    * Return the exit event.
    * If write_child_tid is set, zero out child_tid now if applicable.
@@ -149,9 +152,8 @@ public:
    * ptraced task has had its SIGCHLD sent.
    * Note that we can't set the correct siginfo when we send the signal, because
    * it requires us to set information only the kernel has permission to set.
-   * Returns false if this signal should be deferred.
    */
-  bool set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si);
+  void set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si);
   /**
    * Sets up |si| as if we're delivering a SIGCHLD/waitid for this waited task.
    */
@@ -186,8 +188,12 @@ public:
    */
   bool is_waiting_for(RecordTask* t);
 
-  virtual bool already_exited() const override {
-    return waiting_for_reap || waiting_for_zombie;
+  bool already_exited() const override {
+    return waiting_for_reap;
+  }
+
+  bool is_detached_proxy() const override {
+    return detached_proxy;
   }
 
   /**
@@ -205,13 +211,36 @@ public:
    */
   bool is_signal_pending(int sig);
   /**
+   * Return true if a SIGCONT is pending that ends the job-control stop of this
+   * task: one in the shared queue or in this task's queue, or one sent to a
+   * traced thread of the process. Linux continues all untraced threads of a
+   * process whichever thread a SIGCONT is for. A traced thread doesn't notice
+   * a SIGCONT itself because SIGCONT doesn't end its ptrace stop.
+   */
+  bool is_SIGCONT_pending_for_job_control_stop();
+  /**
    * Return true if there are any signals pending that are not blocked.
    */
   bool has_any_actionable_signal();
   /**
-   * Get all threads out of an emulated GROUP_STOP
+   * True if the task is in an emulated group stop that SIGCONT ends, i.e.
+   * a group stop of a task that has no (emulated) ptracer. For a traced task,
+   * a group stop is a ptrace stop, and SIGCONT doesn't end ptrace stops (see
+   * prepare_signal() in kernel/signal.c).
+   */
+  bool in_job_control_stop() const {
+    return emulated_stop_type == GROUP_STOP && !emulated_ptracer;
+  }
+  /**
+   * Get all threads out of an emulated group stop, as SIGCONT does. Like a
+   * real SIGCONT, this doesn't end ptrace stops, including the group stops of
+   * traced threads.
    */
   void emulate_SIGCONT();
+  /**
+   * Get all threads out of any emulated stop, ptrace stops included.
+   */
+  void end_all_emulated_stops();
   /**
    * Return true if the disposition of |sig| in |table| isn't
    * SIG_IGN or SIG_DFL, that is, if a user sighandler will be
@@ -240,6 +269,10 @@ public:
    * default disposition is "ignore".
    */
   bool is_sig_ignored(int sig) const;
+  /**
+   * Return true iff |sig| is a stopping signal.
+   */
+  bool is_sig_stopping(int sig) const;
   /**
    * Return the applications current disposition of |sig|.
    */
@@ -396,7 +429,8 @@ public:
   void record_local(remote_ptr<T> addr, const T* buf, size_t count = 1) {
     record_local(addr, sizeof(T) * count, buf);
   }
-  void record_remote(remote_ptr<void> addr, ssize_t num_bytes);
+  void record_remote(remote_ptr<void> addr, ssize_t num_bytes,
+                     MemWriteSizeValidation size_validation = MemWriteSizeValidation::EXACT);
   template <typename T> void record_remote(remote_ptr<T> addr) {
     record_remote(addr, sizeof(T));
   }
@@ -413,11 +447,19 @@ public:
   // Record as much as we can of the bytes in this range. Will record only
   // contiguous mapped-writable data starting at `addr`. rr mappings (e.g. syscallbuf)
   // are treated as non-contiguous with any other mapping.
-  void record_remote_writable(remote_ptr<void> addr, ssize_t num_bytes);
+  void record_remote_writable(remote_ptr<void> addr, ssize_t num_bytes,
+                              MemWriteSizeValidation size_validation = MemWriteSizeValidation::EXACT);
 
   // Simple helper that attempts to use the local mapping to record if one
   // exists
   bool record_remote_by_local_map(remote_ptr<void> addr, size_t num_bytes);
+
+  template <typename T>
+  void write_and_record(remote_ptr<T> addr, const T& value, bool* ok = nullptr,
+                        uint32_t flags = 0) {
+    write_mem(addr, value, ok, flags);
+    record_local(addr, &value, 1);
+  }
 
   /**
    * Save tracee data to the trace.  |addr| is the address in
@@ -511,19 +553,6 @@ public:
   bool is_fatal_signal(int sig, SignalDeterministic deterministic) const;
 
   /**
-   * Return the pid of the newborn thread created by this task.
-   * Called when this task has a PTRACE_CLONE_EVENT with CLONE_THREAD.
-   */
-  pid_t find_newborn_thread();
-  /**
-   * Return the pid of the newborn process (whose parent has pid `parent_pid`,
-   * which need not be the same as the current task's pid, due to CLONE_PARENT)
-   * created by this task. Called when this task has a PTRACE_CLONE_EVENT
-   * without CLONE_THREAD, or PTRACE_FORK_EVENT.
-   */
-  pid_t find_newborn_process(pid_t child_parent);
-
-  /**
    * If the process looks alive, kill it.
    */
   void kill_if_alive();
@@ -567,9 +596,8 @@ public:
   sig_set_t read_sigmask_from_process();
   /**
    * Unblock the signal for the process.
-   * Returns `false` if the process died underneath us.
    */
-  bool unblock_signal(int sig);
+  void unblock_signal(int sig);
   /**
    * Set the signal handler to default for the process.
    */
@@ -614,7 +642,7 @@ public:
    */
   void send_synthetic_SIGCHLD_if_necessary();
 
-  bool set_sigmask(sig_set_t mask);
+  void set_sigmask(sig_set_t mask);
 
   /**
    * Update the futex robust list head pointer to |list| (which
@@ -624,6 +652,12 @@ public:
     robust_futex_list = list;
     robust_futex_list_len = len;
   }
+
+  void set_stopped(bool stopped) override;
+
+  // Tries to extend an adjacent `MAP_GROWSDOWN` mapping to include the
+  // given address. Returns false if nothing was done.
+  bool try_grow_map(remote_ptr<void> addr);
 
 private:
   /* Retrieve the tid of this task from the tracee and store it */
@@ -707,7 +741,9 @@ public:
   // tracer attached via PTRACE_SEIZE
   bool emulated_ptrace_seized;
   WaitType in_wait_type;
+  int in_wait_options;
   pid_t in_wait_pid;
+  pid_t creator_tid;
 
   // Signal handler state
 
@@ -734,7 +770,7 @@ public:
   // Syscallbuf state
 
   SyscallbufCodeLayout syscallbuf_code_layout;
-  ScopedFd desched_fd;
+  ContextSwitchEvent desched_fd;
   /* Value of hdr->num_rec_bytes when the buffer was flushed */
   uint32_t flushed_num_rec_bytes;
   /* Nonzero after the trace recorder has flushed the
@@ -779,6 +815,9 @@ public:
   // Stashed signal-delivery state, ready to be delivered at
   // next opportunity.
   std::deque<StashedSignal> stashed_signals;
+  // When true, we're blocking signals during a syscall to
+  // prevent new signals from being delivered. `blocked_sigs_dirty`
+  // is false and `blocked_sigs` contains the previous sigmask.
   bool stashed_signals_blocking_more_signals;
   bool stashed_group_stop;
   bool break_at_syscallbuf_traced_syscalls;
@@ -795,15 +834,9 @@ public:
   // This task is just waiting to be reaped.
   bool waiting_for_reap;
 
-  // This task is waiting to reach zombie state
-  bool waiting_for_zombie;
-
   // This task is waiting for a ptrace exit event. It should not
   // be manually run.
   bool waiting_for_ptrace_exit;
-
-  // When exiting a syscall, we should call MonkeyPatcher::try_patch_syscall again.
-  bool retry_syscall_patching;
 
   // We've sent a SIGKILL during shutdown for this task.
   bool sent_shutdown_kill;

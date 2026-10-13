@@ -58,12 +58,14 @@ public:
    *  current trace record.
    */
   void validate_regs(uint32_t flags = 0);
-  const TraceFrame& current_trace_frame();
-  FrameTime current_frame_time();
-  /** Restore the next chunk of saved data from the trace to this. */
-  ssize_t set_data_from_trace();
+  const TraceFrame& current_trace_frame() const;
+  FrameTime current_frame_time() const;
+
+  /** Restore the next chunk of this frame's saved data from the trace to this. */
+  void apply_data_record_from_trace();
   /** Restore all remaining chunks of saved data for the current trace frame. */
   void apply_all_data_records_from_trace();
+
   /**
    * Set the syscall-return-value register of this to what was
    * saved in the current trace frame.
@@ -75,6 +77,9 @@ public:
    * thread-group leader.
    */
   void set_real_tid_and_update_serial(pid_t tid);
+
+  /** Return the extra registers of this. Asserts if the task died. */
+  const ExtraRegisters& extra_regs();
 
   void note_sched_in_syscallbuf_syscall_hook() {
     seen_sched_in_syscallbuf_syscall_hook = true;
@@ -88,6 +93,8 @@ private:
   template <typename Arch> void init_buffers_arch();
 
   bool post_vm_clone(CloneReason reason, int flags, Task* origin) override;
+  void will_resume_execution(ResumeRequest, WaitRequest, TicksRequest,
+                             int) override;
 
   std::string name_;
 

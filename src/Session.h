@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "AddressSpace.h"
+#include "CPUs.h"
 #include "MonitoredSharedMemory.h"
 #include "Task.h"
 #include "TaskishUid.h"
@@ -134,7 +135,7 @@ struct BreakStatus {
     return result;
   }
 
-  bool any_break() {
+  bool any_break() const {
     return !watchpoints_hit.empty() || signal || breakpoint_hit ||
            singlestep_complete || approaching_ticks_target;
   }
@@ -266,7 +267,7 @@ public:
    * to notify this session that the objects are dying.
    */
   void on_destroy(AddressSpace* vm);
-  virtual void on_destroy(Task* t);
+  void on_destroy(Task* t);
   void on_create(ThreadGroup* tg);
   void on_destroy(ThreadGroup* tg);
 
@@ -289,9 +290,8 @@ public:
   bool is_replaying() { return as_replay() != nullptr; }
   bool is_diversion() { return as_diversion() != nullptr; }
 
-  // Returns true if execution should be "visible", i.e. it's the main
+  // Indicate if execution should be "visible", i.e. it's the main
   // session of a recording or a replay whose output could be echoed.
-  bool visible_execution() const { return visible_execution_; }
   void set_visible_execution(bool visible) { visible_execution_ = visible; }
 
   virtual bool need_performance_counters() const { return true; }
@@ -349,7 +349,7 @@ public:
       new mapping.
       Returns an empty mapping if the tracee unexpectedly died.
    */
-  static const AddressSpace::Mapping& steal_mapping(
+  static AddressSpace::Mapping steal_mapping(
       AutoRemoteSyscalls& remote, const AddressSpace::Mapping& m,
       MonitoredSharedMemory::shr_ptr monitored = nullptr);
 
@@ -373,7 +373,8 @@ public:
   virtual TraceStream* trace_stream() { return nullptr; }
   TicksSemantics ticks_semantics() const { return ticks_semantics_; }
 
-  virtual int cpu_binding() const;
+  // Must be `UNBOUND` or `SPECIFIED_CORE`.
+  virtual BindCPU cpu_binding() const;
 
   int syscall_number_for_rrcall_init_preload() const {
     return SYS_rrcall_init_preload - RR_CALL_BASE + rrcall_base_;
@@ -405,18 +406,26 @@ public:
   uint32_t syscallbuf_fds_disabled_size() const {
     return syscallbuf_fds_disabled_size_;
   }
+  uint32_t syscallbuf_hdr_size() const {
+    return syscallbuf_hdr_size_;
+  }
 
   /* Bind the current process to the a CPU as specified in the session options
      or trace */
   void do_bind_cpu();
-
-  cpu_set_t original_affinity() const { return original_affinity_; }
 
   const ThreadGroupMap& thread_group_map() const { return thread_group_map_; }
 
   virtual int tracee_output_fd(int dflt) {
     return dflt;
   }
+
+  void set_intel_pt_enabled(bool intel_pt) { intel_pt_ = intel_pt; }
+  /* When this is true, we collect Intel PT traces during recording
+     or replay. */
+  bool intel_pt_enabled() const { return intel_pt_; }
+
+  virtual bool mark_stdio() const;
 
 protected:
   Session();
@@ -461,11 +470,10 @@ protected:
 
   int rrcall_base_;
   uint32_t syscallbuf_fds_disabled_size_;
+  uint32_t syscallbuf_hdr_size_;
   PtraceSyscallBeforeSeccomp syscall_seccomp_ordering_;
 
   TicksSemantics ticks_semantics_;
-
-  cpu_set_t original_affinity_;
 
   /**
    * True if we've done an exec so tracees are now in a state that will be
@@ -477,6 +485,11 @@ protected:
    * True while the execution of this session is visible to users.
    */
   bool visible_execution_;
+
+  /**
+   * True while we're collecting Intel PT data.
+   */
+  bool intel_pt_;
 };
 
 } // namespace rr

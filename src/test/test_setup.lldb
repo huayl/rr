@@ -1,0 +1,2 @@
+process handle -p true -s true SIGSEGV
+process handle -p false -s false SIGKILL

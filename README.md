@@ -1,6 +1,6 @@
 # Overview
 
-[![Build status](https://badge.buildkite.com/43782b9c8f7c98ed8a9ba1e82c3baeba59783b675fc4d4c9e4.svg?branch=master)](https://buildkite.com/julialang/rr)
+[![Build and test status](https://github.com/rr-debugger/rr/actions/workflows/build-and-test-main.yml/badge.svg?branch=master)](https://github.com/rr-debugger/rr/actions)
 
 rr is a lightweight tool for recording, replaying and debugging execution of applications (trees of processes and threads).
 Debugging extends gdb with very efficient reverse-execution, which in combination with standard gdb/x86 features like hardware data watchpoints, makes debugging much more fun. More information about the project, including instructions on how to install, run, and build rr, is at [https://rr-project.org](https://rr-project.org). The best technical overview is currently the paper [Engineering Record And Replay For Deployability: Extended Technical Report](https://arxiv.org/pdf/1705.05937.pdf).
@@ -15,9 +15,19 @@ rr development is sponsored by [Pernosco](https://pernos.co) and was originated 
 
 # System requirements
 
-* Linux kernel ≥ 3.11 is required (for `PTRACE_SETSIGMASK`).
+* Linux kernel >= 4.7 (for support of `__WALL` in `waitid()`)
+  * rr 5.6.0 worked with kernel 3.11 (requiring `PTRACE_SETSIGMASK`)
 * rr currently requires either:
   * An Intel CPU with [Nehalem](https://en.wikipedia.org/wiki/Nehalem_%28microarchitecture%29) (2010) or later microarchitecture.
   * Certain AMD Zen or later processors (see https://github.com/rr-debugger/rr/wiki/Zen)
   * Certain AArch64 microarchitectures (e.g. ARM Neoverse N1 or the Apple Silicon M-series)
-* Running in a VM guest is supported, as long as the VM supports virtualization of hardware performance counters. (VMware and KVM are known to work; Xen does not.)
+* Running in a VM guest is supported, as long as the VM supports virtualization of hardware performance counters.
+  * Some configurations of VMware and KVM are known to work.
+  * Some configurations of AWS and GCP VMs are known to work.
+  * No configurations of Xen are known to work.
+
+# AI usage policy
+
+When submitting issues or PRs, please clearly indicate how LLMs were used. Issues or PRs which appear LLM-generated but carry no such indications may be closed without comment.
+
+When submitting PRs for review, the submitter must be human and take full responsibility for understanding the changes, regardless of how LLMs were used.

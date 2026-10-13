@@ -7,6 +7,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <zlib.h>
+#ifdef ZSTD
+#include <zstd.h>
+#endif
 
 #include "log.h"
 #include "util.h"
@@ -25,7 +28,7 @@ public:
   virtual Debugaltlink read_debugaltlink() = 0;
   virtual string read_buildid() = 0;
   virtual string read_interp() = 0;
-  virtual bool addr_to_offset(uintptr_t addr, uintptr_t& offset) = 0;
+  virtual bool addr_to_phdr(uintptr_t addr, PhdrInfo& phdr) = 0;
   virtual SectionOffsets find_section_file_offsets(const char* name) = 0;
   virtual const vector<uint8_t>* decompress_section(SectionOffsets offsets) = 0;
   bool ok() { return ok_; }
@@ -46,7 +49,7 @@ public:
   virtual Debugaltlink read_debugaltlink() override;
   virtual string read_buildid() override;
   virtual string read_interp() override;
-  virtual bool addr_to_offset(uintptr_t addr, uintptr_t& offset) override;
+  virtual bool addr_to_phdr(uintptr_t addr, PhdrInfo& phdr) override;
   virtual SectionOffsets find_section_file_offsets(const char* name) override;
   virtual const vector<uint8_t>* decompress_section(SectionOffsets offsets) override;
 
@@ -88,7 +91,7 @@ ElfReaderImpl<Arch>::ElfReaderImpl(ElfReader& r) : ElfReaderImplBase(r) {
 
   programheader =
       r.read<typename Arch::ElfPhdr>(elfheader->e_phoff, elfheader->e_phnum);
-  if (!programheader || !elfheader->e_phnum) {
+  if (!programheader) {
     LOG(debug) << "Invalid ELF file: no program headers";
     return;
   }
@@ -176,6 +179,8 @@ SectionOffsets ElfReaderImpl<Arch>::find_section_file_offsets(
 
 template <typename Arch>
 const vector<uint8_t>* ElfReaderImpl<Arch>::decompress_section(SectionOffsets offsets) {
+  bool zlib = false;
+  __attribute__((unused)) bool zstd = false;
   DEBUG_ASSERT(offsets.compressed);
   auto hdr = r.read<typename Arch::ElfChdr>(offsets.start);
   if (!hdr) {
@@ -185,15 +190,21 @@ const vector<uint8_t>* ElfReaderImpl<Arch>::decompress_section(SectionOffsets of
   }
 
   size_t decompressed_size = 0;
-  if (hdr->ch_type == ELFCOMPRESS_ZLIB) {
+  if (hdr->ch_type == ELFCOMPRESS_ZLIB || hdr->ch_type == ELFCOMPRESS_ZSTD) {
     decompressed_size = hdr->ch_size;
     offsets.start += sizeof(typename Arch::ElfChdr);
+    if (hdr->ch_type == ELFCOMPRESS_ZLIB) {
+      zlib = true;
+    } else {
+      zstd = true;
+    }
   } else {
     auto legacy_hdr = r.read_bytes(offsets.start, 4);
     if (!memcmp("ZLIB", legacy_hdr, 4)) {
       auto be_size = r.read<uint64_t>(offsets.start + 4);
       decompressed_size = be64toh(*be_size);
       offsets.start += 12;
+      zlib = true;
     } else {
       LOG(warn) << "section at " << offsets.start
                 << " is marked compressed but uses unrecognized"
@@ -205,28 +216,41 @@ const vector<uint8_t>* ElfReaderImpl<Arch>::decompress_section(SectionOffsets of
   unique_ptr<vector<uint8_t>> v(new vector<uint8_t>());
   v->resize(decompressed_size);
 
-  z_stream stream;
-  memset(&stream, 0, sizeof(stream));
-  int result = inflateInit(&stream);
-  if (result != Z_OK) {
-    FATAL() << "inflateInit failed!";
-    return nullptr;
-  }
+  if (zlib) {
+    z_stream stream;
+    memset(&stream, 0, sizeof(stream));
+    int result = inflateInit(&stream);
+    if (result != Z_OK) {
+      FATAL() << "inflateInit failed!";
+      return nullptr;
+    }
 
-  stream.avail_in = offsets.end - offsets.start;
-  stream.next_in = (unsigned char*)r.read_bytes(offsets.start, stream.avail_in);
-  stream.next_out = &v->front();
-  stream.avail_out = v->size();
-  result = inflate(&stream, Z_FINISH);
-  if (result != Z_STREAM_END) {
-    FATAL() << "inflate failed!";
-    return nullptr;
-  }
+    stream.avail_in = offsets.end - offsets.start;
+    stream.next_in = (unsigned char*)r.read_bytes(offsets.start, stream.avail_in);
+    stream.next_out = &v->front();
+    stream.avail_out = v->size();
+    result = inflate(&stream, Z_FINISH);
+    if (result != Z_STREAM_END) {
+      FATAL() << "inflate failed!";
+      return nullptr;
+    }
 
-  result = inflateEnd(&stream);
-  if (result != Z_OK) {
-    FATAL() << "inflateEnd failed!";
-    return nullptr;
+    result = inflateEnd(&stream);
+    if (result != Z_OK) {
+      FATAL() << "inflateEnd failed!";
+      return nullptr;
+    }
+#ifdef ZSTD
+  } else if (zstd) {
+    size_t compressed_size = offsets.end - offsets.start;
+    size_t size = ZSTD_decompress(&v->front(), v->size(),
+                                  r.read_bytes(offsets.start, compressed_size), compressed_size);
+    if (size != v->size()) {
+      FATAL() << "zstd decompression failed";
+    }
+#endif
+  } else {
+    FATAL() << "Unrecognized compression algorithm";
   }
 
   decompressed_sections.push_back(std::move(v));
@@ -494,20 +518,19 @@ string ElfReaderImpl<Arch>::read_interp() {
 }
 
 template <typename Arch>
-bool ElfReaderImpl<Arch>::addr_to_offset(uintptr_t addr, uintptr_t& offset) {
-  for (size_t i = 0; i < sections_size; ++i) {
-    const auto& section = sections[i];
-    // Skip the section if it either "occupies no space in the file" or
-    // doesn't have a valid address because it does not "occupy memory
-    // during process execution".
-    if (section.sh_type == SHT_NOBITS || !(section.sh_flags & SHF_ALLOC)) {
-      continue;
-    }
-    if (addr >= section.sh_addr && addr - section.sh_addr < section.sh_size) {
-      offset = addr - section.sh_addr + section.sh_offset;
+bool ElfReaderImpl<Arch>::addr_to_phdr(uintptr_t addr, PhdrInfo& phdr) {
+  for (size_t i = 0; i < programheader_size; ++i) {
+    auto& p = programheader[i];
+    if (p.p_type == PT_LOAD && addr >= p.p_vaddr &&
+        addr - p.p_vaddr < p.p_memsz) {
+      phdr.vaddr = p.p_vaddr;
+      phdr.offset = p.p_offset;
+      phdr.filesz = p.p_filesz;
+      phdr.flags = p.p_flags;
       return true;
     }
   }
+
   return false;
 }
 
@@ -541,7 +564,7 @@ DwarfSpan ElfReader::dwarf_section(const char* name, bool known_to_be_compressed
   offsets.compressed |= known_to_be_compressed;
   if (offsets.start && offsets.compressed) {
     auto decompressed = impl().decompress_section(offsets);
-    return DwarfSpan(&decompressed->front(), &decompressed->back());
+    return DwarfSpan(decompressed->data(), decompressed->data() + decompressed->size());
   }
   return DwarfSpan(map + offsets.start, map + offsets.end);
 }
@@ -549,8 +572,8 @@ DwarfSpan ElfReader::dwarf_section(const char* name, bool known_to_be_compressed
 string ElfReader::read_buildid() { return impl().read_buildid(); }
 string ElfReader::read_interp() { return impl().read_interp(); }
 
-bool ElfReader::addr_to_offset(uintptr_t addr, uintptr_t& offset) {
-  return impl().addr_to_offset(addr, offset);
+bool ElfReader::addr_to_phdr(uintptr_t addr, PhdrInfo& phdr) {
+  return impl().addr_to_phdr(addr, phdr);
 }
 
 bool ElfReader::ok() { return impl().ok(); }
@@ -576,6 +599,16 @@ ElfFileReader::~ElfFileReader() {
 }
 
 ScopedFd ElfFileReader::open_debug_file(const std::string& elf_file_name) {
+  string build_id = read_buildid();
+  if (build_id.size() > 2) {
+    string debug_path = "/usr/lib/debug/.build-id/" + build_id.substr(0, 2) +
+        "/" + build_id.substr(2) + ".debug";
+    ScopedFd debug_fd(debug_path.c_str(), O_RDONLY);
+    if (debug_fd.is_open()) {
+      return debug_fd;
+    }
+  }
+
   if (elf_file_name.empty() || elf_file_name[0] != '/') {
     return ScopedFd();
   }
@@ -607,7 +640,7 @@ ScopedFd ElfFileReader::open_debug_file(const std::string& elf_file_name) {
     } else if (ret == 0) {
       break;
     } else {
-      crc = crc32(crc, buf, ret);
+      crc = update_crc32(crc, buf, ret);
     }
   }
 

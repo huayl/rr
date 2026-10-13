@@ -2,11 +2,41 @@
 
 #include "util.h"
 
+#ifndef HAVE_TERMIOS2
+/* We have to define termios2 ourselves with glibc. See
+ * https://github.com/npat-efault/picocom/blob/1acf1ddabaf3576b4023c4f6f09c5a3e4b086fb8/termios2.txt
+ * for the long explanation.
+ */
+struct termios2 {
+  tcflag_t c_iflag;
+  tcflag_t c_oflag;
+  tcflag_t c_cflag;
+  tcflag_t c_lflag;
+  cc_t c_line;
+  cc_t c_cc[19];
+  speed_t c_ispeed;
+  speed_t c_ospeed;
+};
+#endif
+
+/* glibc 2.42 removed termio:
+   https://sourceware.org/git/?p=glibc.git;a=commit;h=e04afb71771710cdc6025fe95908f5f17de7b72d
+*/
+struct rr_termio {
+  unsigned short c_iflag;
+  unsigned short c_oflag;
+  unsigned short c_cflag;
+  unsigned short c_lflag;
+  unsigned char c_line;
+  unsigned char c_cc[8];
+};
+
 int main(void) {
   int fd;
   int ret;
   struct termios* tc;
-  struct termio* tio;
+  struct termios2* tc2;
+  struct rr_termio* tio;
   pid_t* pgrp;
   int* navail;
   int* outq;
@@ -93,6 +123,21 @@ int main(void) {
   test_assert(0 == ioctl(sockets[0], FIONREAD, nread));
   VERIFY_GUARD(nread);
   atomic_printf("FIONREAD returned nread=%d\n", *nread);
+
+  ALLOCATE_GUARD(tc2, 'i');
+  test_assert(0 == ioctl(fd, TCGETS2, tc));
+  VERIFY_GUARD(tc2);
+  atomic_printf("TCGETS2 returned { iflag=0x%x, oflag=0x%x, cflag=0x%x, "
+                "lflag=0x%x, ispeed=%d, ospeed=%d }\n",
+                tc2->c_iflag, tc2->c_oflag, tc2->c_cflag, tc2->c_lflag,
+                tc2->c_ispeed, tc2->c_ospeed);
+  test_assert(0 == ioctl(fd, TCSETS2, tc2));
+  test_assert(0 == ioctl(fd, TCSETSW2, tc2));
+  test_assert(0 == ioctl(fd, TCSETSF2, tc2));
+
+  // NB: leaving the TCSETS2 as the last word seems to mess up the terminal,
+  // so fix it.
+  test_assert(0 == ioctl(fd, TCSETS, tc));
 
   atomic_puts("EXIT-SUCCESS");
   return 0;
